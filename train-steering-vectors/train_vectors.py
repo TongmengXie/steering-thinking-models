@@ -10,6 +10,13 @@ import torch
 import re
 from nnsight import NNsight, LanguageModel
 from collections import defaultdict
+import sys
+from pathlib import Path
+
+# Add the parent folder of the current file to the system path
+parent_folder = Path(__file__).resolve().parent.parent
+sys.path.append(str(parent_folder))
+
 from messages import messages
 from tqdm import tqdm
 import os

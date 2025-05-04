@@ -15,7 +15,12 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 import numpy as np
 import torch.nn.functional as F
+
+import sys
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 import utils
+
 import gc
 from jaxtyping import Float
 from einops import einops
