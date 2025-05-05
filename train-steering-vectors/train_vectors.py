@@ -1,18 +1,67 @@
 # %%
+"""
+This script trains steering vectors for model reasoning using a specified language model. 
+It processes messages, extracts thinking processes, annotates them, and calculates mean 
+vectors for different reasoning labels. The script supports loading pre-existing responses 
+from JSON files, updating annotations, and generating new responses.
+Modules and Functions:
+-----------------------
+- `get_batched_message_ids`: Tokenizes and pads a batch of messages for model input.
+- `process_saved_responses_batch`: Processes saved responses to extract layer activations.
+- `process_model_output_batch`: Generates model outputs and extracts layer activations for a batch of messages.
+- `extract_thinking_process`: Extracts the reasoning chain from a model's response.
+- `get_label_positions`: Parses annotations and finds token positions for each label.
+- `get_char_to_token_map`: Creates a mapping from character positions to token positions.
+- `update_mean_vectors`: Updates mean vectors for overall and individual labels based on layer activations.
+- `process_batch_annotations`: Annotates a batch of thinking processes using predefined labels.
+- `process_message_batch`: Processes a batch of messages, updates mean vectors, and optionally annotates responses.
+Main Execution:
+---------------
+- Loads the specified language model and tokenizer.
+- Supports three modes of operation:
+    1. Updating annotations and vectors for existing responses.
+    2. Loading responses from JSON and updating vectors without regenerating responses.
+    3. Generating new responses and calculating vectors.
+- Saves intermediate and final results, including mean vectors and annotated responses.
+Arguments:
+----------
+- `--model`: The model to train steering vectors for (default: "deepseek-ai/DeepSeek-R1-Distill-Llama-8B").
+- `--remote`: Whether to run on the NNsight server (default: True).
+- `--save_every`: Frequency of saving checkpoints (default: 1).
+- `--load_from_json`: Whether to load responses from JSON instead of generating new ones (default: False).
+- `--update_annotation`: Whether to update annotations in the existing JSON file (default: False).
+- `--max_tokens`: Maximum number of tokens to generate (default: 500).
+- `--n_samples`: Number of samples to process (default: 100).
+- `--load_in_8bit`: Whether to load the model in 8-bit mode (default: False).
+- `--seed`: Random seed for reproducibility (default: 42).
+- `--batch_size`: Batch size for processing messages (default: 1).
+Outputs:
+--------
+- Annotated responses saved in JSON format.
+- Mean vectors for reasoning labels saved as PyTorch tensors.
+Dependencies:
+-------------
+- Python libraries: argparse, dotenv, transformers, torch, tqdm, json, re, math, gc.
+- Custom modules: utils, messages, NNsight.
+Usage:
+------
+Run the script with the desired arguments, e.g.:
+        python train_vectors.py --model deepseek-ai/DeepSeek-R1-Distill-Llama-8B --n_samples 500 --max_tokens 1000 --batch_size 4 --save_every 1 --load_from_json --update_annotation
+"""
 import argparse
 import dotenv
-dotenv.load_dotenv(".env")
-
+from dotenv import load_dotenv, find_dotenv
+import os
+from nnsight import NNsight, LanguageModel, CONFIG
 from typing import Any
 from jaxtyping import Float
 from transformers import AutoTokenizer, PreTrainedTokenizer
 import torch
 import re
-from nnsight import NNsight, LanguageModel
 from collections import defaultdict
 import sys
 from pathlib import Path
-
+from pprint import pprint
 # Add the parent folder of the current file to the system path
 parent_folder = Path(__file__).resolve().parent.parent
 sys.path.append(str(parent_folder))
@@ -32,6 +81,8 @@ import gc
 parser = argparse.ArgumentParser(description="Train steering vectors for model reasoning")
 parser.add_argument("--model", type=str, default="deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
                     help="Model to train steering vectors for")
+parser.add_argument("--remote", action="store_true", default=True,
+                    help="Run on nnsight server")
 parser.add_argument("--save_every", type=int, default=1, 
                     help="Save checkpoints every n examples")
 parser.add_argument("--load_from_json", action="store_true", default=False,
@@ -50,12 +101,32 @@ parser.add_argument("--batch_size", type=int, default=1,
                     help="Batch size for processing messages")
 args, _ = parser.parse_known_args()
 
+REMOTE = args.remote
+if REMOTE:
+    # 1. Find the .env file automatically (searches upwards)
+    env_file = find_dotenv(filename=".env", raise_error_if_not_found=False)
+    if not env_file:
+        raise FileNotFoundError("Could not locate a .env file in any parent directory")
+    
+    # 2. Load it *with* override so we ensure variables are set
+    load_dotenv(env_file, override=True)
+    
+    # 3. Confirm it’s there
+    api_key = os.getenv("NN_SIGHT_API_KEY")
+    if api_key is None:
+        raise RuntimeError(f"NN_SIGHT_API_KEY not found in {env_file!r}")
+    
+    CONFIG.set_default_api_key(api_key)
+assert os.getenv("NN_SIGHT_API_KEY") is not None, "NN_SIGHT_API_KEY not set in .env file"
+CONFIG.set_default_api_key(os.getenv("NN_SIGHT_API_KEY"))
+
 # python train_vectors.py --model deepseek-ai/DeepSeek-R1-Distill-Llama-8B --n_samples 500 --max_tokens 1000 --batch_size 4 --save_every 1 --load_from_json --update_annotation
+# python train-steering-vectors/train_vectors.py --model deepseek-ai/DeepSeek-R1-Distill-Llama-8B --batch_size 4 --save_every 1
 
 # %%
 def get_batched_message_ids(tokenizer: PreTrainedTokenizer, 
                             messages_list: list[dict[str, str]], 
-                            apply_chat_template=True):
+                            apply_chat_template=True, remote=REMOTE):
     if apply_chat_template:
         tokenized_messages = [tokenizer.apply_chat_template([msg], add_generation_prompt=True, return_tensors="pt")[0] for msg in messages_list]
     else:
@@ -84,19 +155,22 @@ def get_batched_message_ids(tokenizer: PreTrainedTokenizer,
         input_ids.append(padded_ids)
         attention_masks.append(mask)
     
-    input_ids = torch.stack(input_ids).to("cuda")
-    attention_masks = torch.stack(attention_masks).to("cuda")
-    
+    if remote:
+        # proxies
+        input_ids = torch.stack(input_ids)
+        attention_masks = torch.stack(attention_masks)
+    else:
+        input_ids = torch.stack(input_ids).to("cuda")
+        attention_masks = torch.stack(attention_masks).to("cuda")
     return input_ids, attention_masks
 
-def process_saved_responses_batch(responses_list, tokenizer, model):
+def process_saved_responses_batch(responses_list, tokenizer, model, remote=REMOTE):
     """Get layer activations for a batch of saved responses without generation"""
-    tokenized_responses, attention_masks = get_batched_message_ids(tokenizer, responses_list, apply_chat_template=False)
+    tokenized_responses, attention_masks = get_batched_message_ids(tokenizer, responses_list, apply_chat_template=False, remote=remote)
     
     # Process the inputs through the model to get activations
     layer_outputs = []
-    with model.trace(tokenized_responses) as tracer:
-        
+    with model.trace(tokenized_responses, remote = remote):
         # Capture layer outputs
         for layer_idx in range(model.config.num_hidden_layers):
             layer_outputs.append(model.model.layers[layer_idx].output[0].save())
@@ -121,11 +195,14 @@ def process_saved_responses_batch(responses_list, tokenizer, model):
 
 def process_model_output_batch(messages_batch: list[dict[str, str]], 
                                tokenizer: PreTrainedTokenizer, 
-                               model: LanguageModel):
+                               model: LanguageModel,
+                               remote: bool = True):
     """Get model output and layer activations for a batch of messages"""
     tokenized_messages, attention_masks = get_batched_message_ids(tokenizer=tokenizer, 
                                                                   messages_list=messages_batch, 
-                                                                  apply_chat_template=True)
+                                                                  apply_chat_template=True,
+                                                                  remote=remote)
+                                                                  
     
     # NNsight tracing
     # Reference: https://nnsight.net/notebooks/tutorials/walkthrough/#Getting
@@ -133,13 +210,14 @@ def process_model_output_batch(messages_batch: list[dict[str, str]],
     with model.generate(
         tokenized_messages,
         max_new_tokens=args.max_tokens,
-        pad_token_id=tokenizer.eos_token_id
+        pad_token_id=tokenizer.eos_token_id,
+        remote=remote
     ) as tracer:
         outputs = model.generator.output.save()
 
     # Process the whole batch at once
     layer_outputs: list[Float[torch.Tensor, "batch token_len hidden_size"]] = []
-    with model.trace(outputs):
+    with model.trace(outputs, remote=remote):
         for layer_idx in range(model.config.num_hidden_layers):
             layer_outputs.append(model.model.layers[layer_idx].output[0].save())
     
@@ -302,11 +380,13 @@ def process_message_batch(messages_batch: list[dict[str, str]],
                           model: LanguageModel, 
                           mean_vectors: dict[str, dict[str, Float[torch.Tensor, "num_hidden_layers hidden_size"] | int]], 
                           batch_indices: list[int], 
-                          get_annotation=True):
+                          get_annotation=True, 
+                          remote=REMOTE):
     """Process a batch of messages and update mean vectors"""
     outputs, batch_layer_outputs = process_model_output_batch(messages_batch=messages_batch, 
                                                               tokenizer=tokenizer, 
-                                                              model=model)
+                                                              model=model,
+                                                              remote=remote)
     
     responses = [tokenizer.decode(token_ids=output, skip_special_tokens=True) for output in outputs]
     thinking_processes = [extract_thinking_process(response=response) for response in responses]
@@ -339,12 +419,44 @@ def process_message_batch(messages_batch: list[dict[str, str]],
 # %% Main execution
 model_name = args.model
 
-# Load model using utils function
-print(f"Loading model {model_name}...")
-model, tokenizer = utils.load_model_and_vectors(compute_features=False, 
-                                                model_name=model_name, 
-                                                load_in_8bit=args.load_in_8bit,
-                                                device="auto")
+if REMOTE:
+    # print(f"Loading the {model_name} on NNsight server")
+    # model = LanguageModel(model_name, device_map="auto", torch_dtype=torch.bfloat16)
+    # tokenizer = model.tokenizer
+    
+    # # pprint("Entire config: ", model.config)
+    # try:
+    #     N_HEADS = model.config.n_head
+    # except:
+    #     N_HEADS = model.config.num_attention_heads
+    # try:
+    #     N_LAYERS = model.config.n_layer
+    # except:
+    #     N_LAYERS = model.config.num_hidden_layers
+    # try:
+    #     D_MODEL = model.config.n_embd
+    # except:
+    #     D_MODEL = model.config.hidden_size
+    # try:
+    #     D_HEAD = model.config.d_head
+    # except:
+    #     D_HEAD = model.config.head_dim
+
+    # print(f"Number of heads: {N_HEADS}")
+    # print(f"Number of layers: {N_LAYERS}")
+    # print(f"Model dimension: {D_MODEL}")
+    # print(f"Head dimension: {D_HEAD}\n")
+    model, tokenizer = utils.load_model_and_vectors_nnsight(compute_features=False,
+                                                            model_name=model_name, 
+                                                            load_in_8bit=args.load_in_8bit,)
+
+else:
+    # Load model using utils function
+    print(f"Loading model {model_name}...")
+    model, tokenizer = utils.load_model_and_vectors(compute_features=False, 
+                                                    model_name=model_name, 
+                                                    load_in_8bit=args.load_in_8bit,
+                                                    device="auto")
 
 mean_vectors = defaultdict(lambda: {
     'mean': torch.zeros(model.config.num_hidden_layers, model.config.hidden_size),
@@ -391,7 +503,7 @@ if update_annotation and os.path.exists(responses_json_path):
             responses_data[start_idx + i]["annotated_thinking"] = annotated
         
         # Process saved responses to calculate vectors
-        batch_layer_outputs = process_saved_responses_batch(batch_full_responses, tokenizer, model)
+        batch_layer_outputs = process_saved_responses_batch(batch_full_responses, tokenizer, model, remote=REMOTE)
         
         # Update vectors based on new annotations
         for i, (response_data, layer_outputs) in enumerate(zip(batch_responses, batch_layer_outputs)):
@@ -405,10 +517,11 @@ if update_annotation and os.path.exists(responses_json_path):
             # Save updated JSON
             with open(responses_json_path, "w") as f:
                 json.dump(responses_data, f, indent=2)
+                print(f"Saved updated responses to {responses_json_path}")
             # Save updated vectors
             save_dict = {k: {'mean': v['mean'], 'count': v['count']} for k, v in mean_vectors.items()}
             torch.save(save_dict, save_path)
-
+            print("saved torch tensors")
         del batch_layer_outputs
         torch.cuda.empty_cache()
         gc.collect()
@@ -461,6 +574,7 @@ else:
     num_batches = math.ceil(len(messages) / args.batch_size)
     
     for batch_idx in tqdm(range(num_batches), desc="Processing message batches"):
+        print(f"Processing batch {batch_idx + 1}/{num_batches}")
         start_idx = batch_idx * args.batch_size
         end_idx = min(start_idx + args.batch_size, len(messages))
         

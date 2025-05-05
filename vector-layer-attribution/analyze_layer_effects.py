@@ -1,15 +1,73 @@
 # %%
+"""
+This script analyzes the effects of different reasoning behaviors on the layers of a language model.
+It uses KL divergence as a metric to measure the impact of specific labeled sections of text on the model's 
+hidden layers. The script also visualizes the results by plotting the layer effects for each label.
+Modules and Libraries:
+- argparse: For parsing command-line arguments.
+- dotenv: For loading environment variables from a `.env` file.
+- os: For file and directory operations.
+- torch: For tensor operations and model computations.
+- transformers: For loading and using pre-trained language models.
+- nnsight: For interfacing with the NNsight API and analyzing language models.
+- re: For regular expression operations.
+- tqdm: For progress bars.
+- matplotlib: For plotting results.
+- numpy: For numerical operations.
+- gc: For garbage collection.
+- jaxtyping: For type annotations of tensors.
+- einops: For tensor operations and reshaping.
+Functions:
+- find_label_positions(annotated_response, original_text, tokenizer, label):
+    Parses annotations and finds token positions for a given label in the text.
+- compute_kl_divergence_metric(logits):
+    Computes the KL divergence between the predicted distribution and its detached version.
+- analyze_layer_effects(model, tokenizer, text, label, feature_vectors, label_positions):
+    Analyzes the effects of specific labels on the model's layers by computing gradients and activations.
+- plot_layer_effects(layer_effects, model_name):
+    Plots the layer effects for each label, showing the mean KL divergence and standard deviation across layers.
+Command-line Arguments:
+- --model: The name of the model to analyze (default: "deepseek-ai/DeepSeek-R1-Distill-Llama-8B").
+- --n_examples: The number of examples to analyze per label (default: 10).
+- --load_in_8bit: Whether to load the model in 8-bit mode (default: False).
+- --remote: Whether to run the analysis on the NNsight server (default: True).
+Usage Example:
+Run the script with the following command:
+    python analyze_layer_effects.py --model deepseek-ai/DeepSeek-R1-Distill-Qwen-32B --n_examples 500 --load_in_8bit True
+Output:
+- Results are saved in the `train-steering-vectors/results` directory.
+- Figures showing the layer effects are saved as PNG files in the `results/figures` directory.
+Notes:
+- The script assumes the presence of a `.env` file containing the `NN_SIGHT_API_KEY`.
+- The `utils.load_model_and_vectors` function is used to load the model and compute feature vectors.
+- The script includes a TODO comment questioning the use of a `continue` statement in the `find_label_positions` function.
+"""
+# python vector-layer-attribution/analyze_layer_effects.py --model deepseek-ai/DeepSeek-R1-Distill-Llama-8B --n_examples 20 --load_in_8bit True --remote True
 import argparse
 import dotenv
-dotenv.load_dotenv(".env")
-
 import os
+from dotenv import load_dotenv, find_dotenv
+env_file = find_dotenv(filename=".env", raise_error_if_not_found=False)
+if not env_file:
+    raise FileNotFoundError("Could not locate a .env file in any parent directory")
+
+# 2. Load it *with* override so we ensure variables are set
+load_dotenv(env_file, override=True)
+
+# 3. Confirm it’s there
+api_key = os.getenv("NN_SIGHT_API_KEY")
+if api_key is None:
+    raise RuntimeError(f"NN_SIGHT_API_KEY not found in {env_file!r}")
+from nnsight import NNsight, LanguageModel, CONFIG
+CONFIG.set_default_api_key(api_key)
+
+from typing import Any
 import torch
 from torch import Tensor
 import json
 from transformers import AutoTokenizer, AutoModelForCausalLM, PreTrainedTokenizer
-from nnsight import NNsight, LanguageModel, CONFIG
-CONFIG.set_default_api_key(os.getenv("NDIF_API_KEY"))
+
+CONFIG.set_default_api_key(os.getenv("NN_SIGHT_API_KEY"))
 import re
 from tqdm import tqdm
 import matplotlib.pyplot as plt
@@ -33,8 +91,10 @@ parser.add_argument("--n_examples", type=int, default=10,
                     help="Number of examples to analyze per label")
 parser.add_argument("--load_in_8bit", type=bool, default=False,
                     help="Load the model in 8-bit mode")
+parser.add_argument("--remote", action="store_true", default=True,
+                    help="Run on nnsight server")
 args, _ = parser.parse_known_args()
-
+REMOTE = args.remote
 # give eample run command
 # python analyze_layer_effects --model deepseek-ai/DeepSeek-R1-Distill-Qwen-32B --n_examples 500 --load_in_8bit True
 
@@ -95,7 +155,7 @@ def analyze_layer_effects(model: LanguageModel,
 
     input_ids: Float[Tensor, "batch seq_len"] = tokenizer(text, return_tensors="pt").input_ids
 
-    with model.session(remote=True):
+    with model.session(remote=REMOTE):
         for pos in label_positions:            
             start, end = pos
             with model.trace(input_ids[:, :end]):
@@ -251,6 +311,7 @@ def plot_layer_effects(layer_effects: dict[str, list[list[float]]], model_name: 
 # %%
 # Load model and data
 model_name: str = args.model
+REMOTE = args.remote
 print(f"Loading model {model_name}...")
 feature_vectors: dict[str, Float[Tensor, "num_hidden_layers hidden_size"]] = {}
 model, tokenizer, feature_vectors = utils.load_model_and_vectors(

@@ -1,8 +1,52 @@
 # %%
+"""
+This script evaluates the effects of steering on the reasoning process of a language model.
+It provides functionality to analyze and visualize how steering impacts the model's behavior
+across various reasoning labels.
+Modules and Functions:
+-----------------------
+1. `get_label_counts(thinking_process, labels)`:
+    - Analyzes a reasoning chain and calculates the fraction of tokens associated with each label.
+    - Returns label fractions and the annotated response.
+2. `generate_and_analyze(model, tokenizer, message, feature_vectors, model_steering_config, label, labels, steer_mode="none")`:
+    - Generates a response from the model with optional steering applied.
+    - Extracts the reasoning process, calculates label fractions, and returns analysis results.
+3. `plot_label_statistics(results, model_name)`:
+    - Visualizes the average fraction of sentences associated with each label for original, positive, and negative steering modes.
+    - Saves the plot as a PDF file.
+Command-Line Arguments:
+-----------------------
+- `--model`: The model to evaluate (default: "deepseek-ai/DeepSeek-R1-Distill-Llama-8B").
+- `--n_examples`: Number of examples to use for evaluation (default: 50).
+- `--max_tokens`: Maximum number of tokens to generate (default: 1000).
+- `--load_in_8bit`: Whether to load the model in 8-bit mode (default: False).
+- `--seed`: Random seed for reproducibility (default: 42).
+- `--remote`: Whether to run on the nnsight server (default: True).
+Workflow:
+---------
+1. Parse command-line arguments.
+2. Load the specified model and feature vectors.
+3. Randomly sample evaluation examples.
+4. For each label, generate and analyze responses for original, positive, and negative steering modes.
+5. Save the evaluation results to a JSON file.
+6. Plot and save the label statistics as a PDF.
+Directories:
+------------
+- `results/vars`: Stores evaluation results in JSON format.
+- `results/figures`: Stores visualizations of label statistics.
+Dependencies:
+-------------
+- Python libraries: argparse, dotenv, torch, re, json, random, tqdm, matplotlib, numpy, collections, gc, os.
+- Custom modules: utils, messages.
+Usage:
+------
+Run the script with appropriate command-line arguments to evaluate and visualize the steering effects on the model's reasoning process.
+"""
 import argparse
 import dotenv
 dotenv.load_dotenv("../.env")
-
+from nnsight import CONFIG
+CONFIG.set_default_api_key(os.getenv("NN_SIGHT_API_KEY"))
 import torch
 import re
 import json
@@ -16,6 +60,8 @@ from collections import defaultdict
 import gc
 import os
 import utils
+from nnsight import NNsight, LanguageModel, CONFIG
+from typing import Any
 
 # Parse arguments
 parser = argparse.ArgumentParser(description="Evaluate steering effects on model reasoning")
@@ -29,6 +75,8 @@ parser.add_argument("--load_in_8bit", type=bool, default=False,
                     help="Load model in 8-bit mode")
 parser.add_argument("--seed", type=int, default=42, 
                     help="Random seed")
+parser.add_argument("--remote", action="store_true", default=True,
+                    help="Run on nnsight server")
 args = parser.parse_args()
 
 # %%
@@ -189,14 +237,19 @@ n_examples = args.n_examples
 random.seed(args.seed)
 model_name = args.model
 model_id = model_name.split('/')[-1].lower()
-
+REMOTE = args.remote
 # %% Create data directory if it doesn't exist
 os.makedirs('results/vars', exist_ok=True)
 os.makedirs('results/figures', exist_ok=True)
 
-# Load model and vectors
-print(f"Loading model {model_name}...")
-model, tokenizer, feature_vectors = utils.load_model_and_vectors(compute_features=True, model_name=model_name, load_in_8bit=args.load_in_8bit)
+model_name = args.model
+
+if REMOTE:
+    utils.load_model_and_vectors(compute_features=True, model_name=model_name, load_in_8bit=args.load_in_8bit, device="auto")
+else:
+    # Load model and vectors
+    print(f"Loading model {model_name}...")
+    model, tokenizer, feature_vectors = utils.load_model_and_vectors(compute_features=True, model_name=model_name, load_in_8bit=args.load_in_8bit)
 
 # %% Randomly sample evaluation examples
 eval_indices = random.sample(range(len(eval_messages)), n_examples)
