@@ -418,45 +418,19 @@ def process_message_batch(messages_batch: list[dict[str, str]],
 
 # %% Main execution
 model_name = args.model
-
+print(f"Loading model {model_name}...")
 if REMOTE:
-    # print(f"Loading the {model_name} on NNsight server")
-    # model = LanguageModel(model_name, device_map="auto", torch_dtype=torch.bfloat16)
-    # tokenizer = model.tokenizer
     
-    # # pprint("Entire config: ", model.config)
-    # try:
-    #     N_HEADS = model.config.n_head
-    # except:
-    #     N_HEADS = model.config.num_attention_heads
-    # try:
-    #     N_LAYERS = model.config.n_layer
-    # except:
-    #     N_LAYERS = model.config.num_hidden_layers
-    # try:
-    #     D_MODEL = model.config.n_embd
-    # except:
-    #     D_MODEL = model.config.hidden_size
-    # try:
-    #     D_HEAD = model.config.d_head
-    # except:
-    #     D_HEAD = model.config.head_dim
-
-    # print(f"Number of heads: {N_HEADS}")
-    # print(f"Number of layers: {N_LAYERS}")
-    # print(f"Model dimension: {D_MODEL}")
-    # print(f"Head dimension: {D_HEAD}\n")
-    model, tokenizer = utils.load_model_and_vectors_nnsight(compute_features=False,
-                                                            model_name=model_name, 
-                                                            load_in_8bit=args.load_in_8bit,)
-
-else:
-    # Load model using utils function
-    print(f"Loading model {model_name}...")
     model, tokenizer = utils.load_model_and_vectors(compute_features=False, 
                                                     model_name=model_name, 
                                                     load_in_8bit=args.load_in_8bit,
                                                     device="auto")
+else:
+    # Load model using utils function
+    model, tokenizer = utils.load_model_and_vectors(compute_features=False, 
+                                                    model_name=model_name, 
+                                                    load_in_8bit=args.load_in_8bit,
+                                                    device="cuda")
 
 mean_vectors = defaultdict(lambda: {
     'mean': torch.zeros(model.config.num_hidden_layers, model.config.hidden_size),

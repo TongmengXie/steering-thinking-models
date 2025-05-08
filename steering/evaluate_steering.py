@@ -46,11 +46,15 @@ import argparse
 import dotenv
 dotenv.load_dotenv("../.env")
 from nnsight import CONFIG
+import os
 CONFIG.set_default_api_key(os.getenv("NN_SIGHT_API_KEY"))
 import torch
 import re
 import json
 import random
+# add the parent directory to the path
+import sys
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from messages import eval_messages
 import messages
 from tqdm import tqdm
@@ -62,7 +66,7 @@ import os
 import utils
 from nnsight import NNsight, LanguageModel, CONFIG
 from typing import Any
-
+import os
 # Parse arguments
 parser = argparse.ArgumentParser(description="Evaluate steering effects on model reasoning")
 parser.add_argument("--model", type=str, default="deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
@@ -77,7 +81,12 @@ parser.add_argument("--seed", type=int, default=42,
                     help="Random seed")
 parser.add_argument("--remote", action="store_true", default=True,
                     help="Run on nnsight server")
+parser.add_argument("--plot_only", action="store_true", default=False,
+                    help="Only plot the results without running the evaluation")
 args = parser.parse_args()
+
+# example run
+# python steering/evaluate_steering.py --model deepseek-ai/DeepSeek-R1-Distill-Llama-8B --seed 42 --load_in_8bit True --remote --n_examples 10
 
 # %%
 def get_label_counts(thinking_process, labels):
@@ -127,8 +136,8 @@ def get_label_counts(thinking_process, labels):
     return label_fractions, annotated_response
 
 def generate_and_analyze(model, tokenizer, message, feature_vectors, model_steering_config, label, labels, steer_mode="none"):
-    input_ids = tokenizer.apply_chat_template([message], add_generation_prompt=True, return_tensors="pt").to("cuda")
-    
+    # input_ids = tokenizer.apply_chat_template([message], add_generation_prompt=True, return_tensors="pt").to("cuda")
+    input_ids = tokenizer.apply_chat_template([message], add_generation_prompt=True, return_tensors="pt")
     steer_positive = True if steer_mode == "positive" else False
 
     output_ids = utils.custom_generate_with_projection_removal(
@@ -238,46 +247,56 @@ random.seed(args.seed)
 model_name = args.model
 model_id = model_name.split('/')[-1].lower()
 REMOTE = args.remote
-# %% Create data directory if it doesn't exist
-os.makedirs('results/vars', exist_ok=True)
-os.makedirs('results/figures', exist_ok=True)
+PLOT_ONLY = args.plot_only
 
-model_name = args.model
+if not PLOT_ONLY:
+    # %% Create data directory if it doesn't exist
+    os.makedirs('results/vars', exist_ok=True)
+    os.makedirs('results/figures', exist_ok=True)
 
-if REMOTE:
-    utils.load_model_and_vectors(compute_features=True, model_name=model_name, load_in_8bit=args.load_in_8bit, device="auto")
-else:
-    # Load model and vectors
+    model_name = args.model
     print(f"Loading model {model_name}...")
-    model, tokenizer, feature_vectors = utils.load_model_and_vectors(compute_features=True, model_name=model_name, load_in_8bit=args.load_in_8bit)
-
-# %% Randomly sample evaluation examples
-eval_indices = random.sample(range(len(eval_messages)), n_examples)
-
-# Store results
-labels = ['adding-knowledge', 'uncertainty-estimation', 'example-testing', 'backtracking']
-results = {label: [] for label in labels}
-
-# Evaluate each label
-for label in labels:
-    for idx in tqdm(eval_indices, desc=f"Processing examples for {label}"):
-        message = eval_messages[idx]
-
-        # Only proceed if original version has >5% of the target label
-        example_results = {
-            "original": generate_and_analyze(model, tokenizer, message, feature_vectors, utils.steering_config[model_name], label, labels, "none"),
-            "positive": generate_and_analyze(model, tokenizer, message, feature_vectors, utils.steering_config[model_name], label, labels, "positive"),
-            "negative": generate_and_analyze(model, tokenizer, message, feature_vectors, utils.steering_config[model_name], label, labels, "negative")
-        }
+    if REMOTE:
+        model, tokenizer, feature_vectors = utils.load_model_and_vectors(compute_features=True, model_name=model_name, load_in_8bit=args.load_in_8bit, device="auto", dispatch=False)
+    else:
+        # Load model and vectors
         
-        results[label].append(example_results)
+        model, tokenizer, feature_vectors = utils.load_model_and_vectors(compute_features=True, model_name=model_name, load_in_8bit=args.load_in_8bit)
 
-# Save results
-with open(f'results/vars/steering_evaluation_results_{model_id}.json', 'w') as f:
-    json.dump(results, f, indent=2)
+    # %% Randomly sample evaluation examples
+    eval_indices = random.sample(range(len(eval_messages)), n_examples)
 
-# %% Plot statistics
-results = json.load(open(f'results/vars/steering_evaluation_results_{model_id}.json'))
-plot_label_statistics(results, model_name)
+    # Store results
+    # labels = ['adding-knowledge', 'uncertainty-estimation', 'example-testing', 'backtracking']
+
+    labels = ['backtracking']
+    results = {label: [] for label in labels}
+
+    # Evaluate each label
+    for label in labels:
+        for idx in tqdm(eval_indices, desc=f"Processing examples for {label}"):
+            message = eval_messages[idx]
+
+            # Only proceed if original version has >5% of the target label
+            example_results = {
+                "original": generate_and_analyze(model, tokenizer, message, feature_vectors, utils.steering_config[model_name], label, labels, "none"),
+                "positive": generate_and_analyze(model, tokenizer, message, feature_vectors, utils.steering_config[model_name], label, labels, "positive"),
+                "negative": generate_and_analyze(model, tokenizer, message, feature_vectors, utils.steering_config[model_name], label, labels, "negative")
+            }
+            print(example_results)
+            results[label].append(example_results)
+        # save for each label
+        print(f"Saving all results until {label}...")
+        with open(f'results/vars/steering_evaluation_results_{model_id}.json', 'w') as f:
+            json.dump(results, f, indent=2)
+
+    # Save results
+    with open(f'results/vars/steering_evaluation_results_{model_id}.json', 'w') as f:
+        json.dump(results, f, indent=2)
+        
+else:
+    # %% Plot statistics
+    results = json.load(open(f'results/vars/steering_evaluation_results_{model_id}.json'))
+    plot_label_statistics(results, model_name)
 
 # %%

@@ -1,4 +1,10 @@
 '''
+Note: 
+    - shouldn't mention cuda when on remote mode
+    - should use intermediate activations as proxies
+    - debug: if downloading from nn_sight are several KBs, then you are probably doing right. 
+    Any big files (e.g., 100 MBs) probably mean you have downloaded the intermediate activations from the server, can you avoid while achieving your objective?
+    
 This module provides various utilities for working with language models, including
 functions for generating text, categorizing reasoning traces, autograding, and
 processing saved responses. It also includes helper functions for loading models,
@@ -32,7 +38,6 @@ Constants:
     - steering_config: Configuration for steering specific reasoning functions in various models.
 Classes:
     - NumpyEncoder: A JSON encoder for handling numpy types.
-
 '''
 import dotenv
 dotenv.load_dotenv(".env")
@@ -748,7 +753,7 @@ def load_model_and_vectors(device="cuda:0", load_in_8bit=False, compute_features
             del model
             if base_model:
                 del base_model
-            torch.cuda.empty_cache()
+            # torch.cuda.empty_cache() # no cuda in remote mode
             gc.collect()
             raise e
         warnings.warn(f"Expected error due to 1st time running, so the mean_vectors file of {model_id} does not exist yet. Proceeding without mean vectors.")
@@ -791,6 +796,7 @@ def custom_generate_with_projection_removal(model, tokenizer, input_ids, max_new
         label: The label to steer towards/away from
         feature_vectors: Dictionary of feature vectors containing steering_vector_set
         steer_positive: If True, steer towards the label, if False steer away
+        remote: Default to True
     """
     model_layers = model.model.layers
 
@@ -798,6 +804,7 @@ def custom_generate_with_projection_removal(model, tokenizer, input_ids, max_new
         input_ids,
         max_new_tokens=max_new_tokens,
         pad_token_id=tokenizer.eos_token_id,
+        remote=True
     ) as tracer:
         # Apply .all() to model to ensure interventions work across all generations
         model_layers.all()
@@ -810,11 +817,15 @@ def custom_generate_with_projection_removal(model, tokenizer, input_ids, max_new
      
 
             if steer_positive:
-                feature_vector = feature_vectors[label][vector_layer].to("cuda").to(torch.bfloat16)
+                # feature_vector = feature_vectors[label][vector_layer].to("cuda").to(torch.bfloat16) # This line should be used in non-remote version
+                feature_vector = feature_vectors[label][vector_layer] # can't we use it as proxy?
                 for layer_idx in pos_layers:         
-                    model.model.layers[layer_idx].output[0][:, :] += coefficient * feature_vector.unsqueeze(0).unsqueeze(0)
+                    model.model.layers[layer_idx].output[0][:, :] += coefficient * feature_vector.unsqueeze(0).unsqueeze(0) 
+                    # The core to this function: activation coefficient * vector is added
+                    # different than 1.4.2 ARENA, we add feature vector at all positions in the sequence
             else:
-                feature_vector = feature_vectors[label][vector_layer].to("cuda").to(torch.bfloat16)
+                # feature_vector = feature_vectors[label][vector_layer].to("cuda").to(torch.bfloat16) # This line should be used in non-remote version
+                feature_vector = feature_vectors[label][vector_layer]
                 for layer_idx in neg_layers:         
                     model.model.layers[layer_idx].output[0][:, :] -= coefficient * feature_vector.unsqueeze(0).unsqueeze(0)
         
