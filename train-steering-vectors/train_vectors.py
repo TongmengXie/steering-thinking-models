@@ -58,6 +58,10 @@ from jaxtyping import Float
 from transformers import AutoTokenizer, PreTrainedTokenizer
 import torch
 import re
+
+import nnsight
+from nnsight import NNsight, LanguageModel
+
 from collections import defaultdict
 import sys
 from pathlib import Path
@@ -78,6 +82,17 @@ reload(utils)
 import math
 import gc
 # Parse arguments
+class Arguments(argparse.Namespace):
+    model: str
+    save_every: int
+    load_from_json: bool
+    update_annotation: bool
+    max_tokens: int
+    n_samples: int
+    load_in_8bit: bool
+    seed: int
+    batch_size: int
+    dispatch: bool
 parser = argparse.ArgumentParser(description="Train steering vectors for model reasoning")
 parser.add_argument("--model", type=str, default="deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
                     help="Model to train steering vectors for")
@@ -99,7 +114,9 @@ parser.add_argument("--seed", type=int, default=42,
                     help="Random seed")
 parser.add_argument("--batch_size", type=int, default=1,
                     help="Batch size for processing messages")
-args, _ = parser.parse_known_args()
+parser.add_argument("--dispatch", action="store_true", default=False,
+                    help="Load the model locally")
+args, _ = parser.parse_known_args(namespace=Arguments)
 
 REMOTE = args.remote
 if REMOTE:
@@ -127,6 +144,7 @@ CONFIG.set_default_api_key(os.getenv("NN_SIGHT_API_KEY"))
 def get_batched_message_ids(tokenizer: PreTrainedTokenizer, 
                             messages_list: list[dict[str, str]], 
                             apply_chat_template=True, remote=REMOTE):
+
     if apply_chat_template:
         tokenized_messages = [tokenizer.apply_chat_template([msg], add_generation_prompt=True, return_tensors="pt")[0] for msg in messages_list]
     else:
@@ -155,6 +173,7 @@ def get_batched_message_ids(tokenizer: PreTrainedTokenizer,
         input_ids.append(padded_ids)
         attention_masks.append(mask)
     
+
     if remote:
         # proxies
         input_ids = torch.stack(input_ids)
@@ -196,13 +215,16 @@ def process_saved_responses_batch(responses_list, tokenizer, model, remote=REMOT
 def process_model_output_batch(messages_batch: list[dict[str, str]], 
                                tokenizer: PreTrainedTokenizer, 
                                model: LanguageModel,
+
                                remote: bool = True):
+
     """Get model output and layer activations for a batch of messages"""
     tokenized_messages, attention_masks = get_batched_message_ids(tokenizer=tokenizer, 
                                                                   messages_list=messages_batch, 
                                                                   apply_chat_template=True,
                                                                   remote=remote)
                                                                   
+
     
     # NNsight tracing
     # Reference: https://nnsight.net/notebooks/tutorials/walkthrough/#Getting
@@ -220,22 +242,23 @@ def process_model_output_batch(messages_batch: list[dict[str, str]],
     with model.trace(outputs, remote=remote):
         for layer_idx in range(model.config.num_hidden_layers):
             layer_outputs.append(model.model.layers[layer_idx].output[0].save())
-    
-    layer_outputs = [x.value.cpu().detach().to(torch.float32) for x in layer_outputs]
 
-    batch_layer_outputs: list[Float[torch.Tensor, "num_hidden_layers token_len hidden_size"]] = []
     
-    for batch_idx in range(len(messages_batch)):
-        # get length of padding tokens
-        padding_length = (attention_masks[batch_idx].squeeze() == 0).sum().item()
-        
-        # Slice out just the non-padded activations for this example across all layers
-        example_outputs = torch.stack([
-            layer_output[batch_idx][padding_length:] 
-            for layer_output in layer_outputs
-        ])
-        
-        batch_layer_outputs.append(example_outputs)
+        layer_outputs = [x.cpu().detach().to(torch.float32) for x in layer_outputs]
+
+        batch_layer_outputs = nnsight.list().save()
+    
+        for batch_idx in range(len(messages_batch)):
+            # get length of padding tokens
+            padding_length = (attention_masks[batch_idx].squeeze() == 0).sum().item()
+            
+            # Slice out just the non-padded activations for this example across all layers
+            example_outputs = torch.stack([
+                layer_output[batch_idx][padding_length:] 
+                for layer_output in layer_outputs
+            ])
+            
+            batch_layer_outputs.append(example_outputs)
     
     return outputs, batch_layer_outputs
 
@@ -382,6 +405,7 @@ def process_message_batch(messages_batch: list[dict[str, str]],
                           batch_indices: list[int], 
                           get_annotation=True, 
                           remote=REMOTE):
+
     """Process a batch of messages and update mean vectors"""
     outputs, batch_layer_outputs = process_model_output_batch(messages_batch=messages_batch, 
                                                               tokenizer=tokenizer, 
@@ -431,6 +455,7 @@ else:
                                                     model_name=model_name, 
                                                     load_in_8bit=args.load_in_8bit,
                                                     device="cuda")
+
 
 mean_vectors = defaultdict(lambda: {
     'mean': torch.zeros(model.config.num_hidden_layers, model.config.hidden_size),
@@ -559,7 +584,8 @@ else:
                                            tokenizer=tokenizer, 
                                            model=model,
                                            mean_vectors=mean_vectors,
-                                           batch_indices=batch_indices)
+                                           batch_indices=batch_indices,
+                                           remote=not args.dispatch)
         responses_data.extend(batch_data)
         
         if batch_idx % save_every == 0:

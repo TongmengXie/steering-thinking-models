@@ -43,7 +43,8 @@ import dotenv
 dotenv.load_dotenv(".env")
 
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, PreTrainedTokenizer
+from nnsight import LanguageModel
 from tqdm import tqdm
 import gc
 import time
@@ -62,6 +63,9 @@ from nnsight import NNsight, LanguageModel, CONFIG
 from typing import Any
 CONFIG.set_default_api_key(os.getenv("NN_SIGHT_API_KEY"))
 
+from typing import TypedDict
+
+
 class LinearProbe(nn.Module):
     def __init__(self, hidden_size, num_labels):
         super().__init__()
@@ -69,7 +73,15 @@ class LinearProbe(nn.Module):
         
     def forward(self, x):
         return self.linear(x)
+    
+class SteeringDict(TypedDict):
+    vector_layer: int
+    pos_layers: list[int]
+    neg_layers: list[int]
+    pos_coefficient: float
+    neg_coefficient: float
 
+SteeringConfig = dict[str, dict[str, SteeringDict]]
 
 def chat(prompt, model="gpt-4.1", max_tokens=28000):
 
@@ -760,7 +772,7 @@ def load_model_and_vectors(device="cuda:0", load_in_8bit=False, compute_features
 
     if compute_features:
         # Compute feature vectors by subtracting overall mean
-        feature_vectors: dict[str, ] = {}
+        feature_vectors: dict[str, Float[torch.Tensor, "num_hidden_layers hidden_size"]] = {}
         feature_vectors["overall"] = mean_vectors_dict["overall"]['mean']
         
         for label in mean_vectors_dict:
@@ -779,12 +791,18 @@ def load_model_and_vectors(device="cuda:0", load_in_8bit=False, compute_features
         return model, tokenizer, base_model, base_tokenizer, mean_vectors_dict
     elif base_model_name is None and compute_features:
         return model, tokenizer, feature_vectors
-    elif mean_vectors_dict is None:
-        return model, tokenizer
     else:
         return model, tokenizer, mean_vectors_dict
 
-def custom_generate_with_projection_removal(model, tokenizer, input_ids, max_new_tokens, label, feature_vectors, steering_config, steer_positive=False):
+def custom_generate_with_projection_removal(
+        model: LanguageModel, 
+        tokenizer: PreTrainedTokenizer, 
+        input_ids, 
+        max_new_tokens: int, 
+        label: str | None, 
+        feature_vectors: Float[torch.Tensor, "num_hidden_layers hidden_size"] | None, 
+        steering_config: dict[str, SteeringDict], 
+        steer_positive=False):
     """
     Generate text while removing or adding projections of specific features.
     
@@ -799,6 +817,7 @@ def custom_generate_with_projection_removal(model, tokenizer, input_ids, max_new
         remote: Default to True
     """
     model_layers = model.model.layers
+
 
     with model.generate(
         input_ids,
@@ -828,8 +847,21 @@ def custom_generate_with_projection_removal(model, tokenizer, input_ids, max_new
                 feature_vector = feature_vectors[label][vector_layer]
                 for layer_idx in neg_layers:         
                     model.model.layers[layer_idx].output[0][:, :] -= coefficient * feature_vector.unsqueeze(0).unsqueeze(0)
-        
-        outputs = model.generator.output.save()
+                if steer_positive:
+                    feature_vector = feature_vectors[label][vector_layer]
+                    for layer_idx in pos_layers:         
+                        model.model.layers[layer_idx].output[0][:, :] += coefficient * feature_vector.unsqueeze(0).unsqueeze(0)
+                else:
+                    feature_vector = feature_vectors[label][vector_layer]
+                    for layer_idx in neg_layers:         
+                        # model.model.layers[layer_idx].output[0][:, :] -= coefficient * feature_vector.unsqueeze(0).unsqueeze(0)
+                        
+                        # ablate the feature vector
+                        model.model.layers[layer_idx].output[0][:, :] -= (
+                            ( feature_vector / feature_vector.norm(dim=-1, keepdim=True) ) 
+                            * model.model.layers[layer_idx].output[0][:, :]
+                        )
+            outputs = model.generator.output.save()
                     
     return outputs
 
@@ -923,7 +955,7 @@ def convert_numpy_types(obj):
 #  generating-additional-considerations
 #  logical-structure-testing
 
-steering_config = {
+steering_config: SteeringConfig = {
     "deepseek-ai/DeepSeek-R1-Distill-Llama-8B": {
         "backtracking": {"vector_layer": 12, "pos_layers": [12], "neg_layers": [12], "pos_coefficient": 1, "neg_coefficient": 1},
         "uncertainty-estimation": {"vector_layer": 12, "pos_layers": [12], "neg_layers": [12], "pos_coefficient": 1, "neg_coefficient": 1},
